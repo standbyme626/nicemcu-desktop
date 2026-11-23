@@ -82,7 +82,7 @@
 | 能力 | 实现 | 说明 |
 |---|---|---|
 | 仪表盘 | LVGL 9.6 + 2×2 卡片 | 时钟、日期、天气、设备状态、番茄钟，横屏 320×240 |
-| 天气 | open-meteo（HTTP）+ SNTP | 默认广州坐标，可改；15 分钟刷新，失败 30s 重试 |
+| 天气 | open-meteo（HTTP）+ SNTP | 默认深圳坐标（menuconfig 可改经纬度）；15 分钟刷新，失败 30s 重试 |
 | 网络状态 | WiFi STA + esp_wifi | SSID/信号/IP/内存/运行时长，断线 5s 自动重连 |
 | 番茄钟 | 状态机 + 1s 定时器 | 25 分钟工作 / 5 分钟休息自动切换；点按开始/暂停，长按重置 |
 | 设置弹层 | LVGL 自定义面板 | 亮度滑条、刷新天气、息屏、关于、关闭 |
@@ -169,7 +169,7 @@ cd nicemcu-desktop
 git clone --depth 1 --branch v9.6.0 https://github.com/lvgl/lvgl.git components/lvgl
 
 idf.py set-target esp32s3
-idf.py menuconfig   # Desktop -> WiFi SSID/password、media-web host/user/password
+idf.py menuconfig   # Desktop -> WiFi、media-web、天气经纬度（默认深圳）
 idf.py build
 idf.py -p /dev/ttyACM0 flash monitor
 ```
@@ -257,7 +257,7 @@ nicemcu-desktop/
 ├── sdkconfig.defaults          # 已脱敏：WiFi / media 凭据留空
 ├── main/
 │   ├── main.c                  # 显示/触摸/网络/媒体/UI 全部逻辑
-│   ├── Kconfig.projbuild       # WiFi / media-web / 字体配置
+│   ├── Kconfig.projbuild       # WiFi / media-web / 天气经纬度 / 配置
 │   └── fonts/                  # 生成的位图字体（Noto Sans SC + FA 符号）
 ├── components/lvgl -> ...      # 本地 LVGL 9.6（gitignore，不入库）
 └── README.md

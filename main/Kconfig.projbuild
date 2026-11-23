@@ -8,6 +8,14 @@ menu "Desktop"
         string "WiFi password"
         default ""
 
+    config DESKTOP_LAT
+        string "Weather latitude"
+        default "22.5455"
+
+    config DESKTOP_LON
+        string "Weather longitude"
+        default "114.0683"
+
     config DESKTOP_MEDIA_HOST
         string "media-web host or IP"
         default "192.168.1.100"

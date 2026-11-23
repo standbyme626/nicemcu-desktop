@@ -326,9 +326,11 @@ static const char *wx_text(int code)
 static bool weather_fetch(void)
 {
     ESP_LOGI(TAG, "weather fetch, heap=%u", (unsigned)esp_get_free_heap_size());
-    const double lat = 23.1317, lon = 113.266;
+    const double lat = atof(CONFIG_DESKTOP_LAT);
+    const double lon = atof(CONFIG_DESKTOP_LON);
     int n;
     static char buf[4096], url[320];
+    ESP_LOGI(TAG, "weather coords lat=%.4f lon=%.4f", lat, lon);
     snprintf(url, sizeof url,
              "http://api.open-meteo.com/v1/forecast?latitude=%.4f&longitude=%.4f"
              "&current=temperature_2m,relative_humidity_2m,weather_code,wind_speed_10m"
