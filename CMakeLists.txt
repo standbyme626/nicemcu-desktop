@@ -1,3 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_LIST_DIR}/version.txt")
+file(STRINGS "${CMAKE_CURRENT_LIST_DIR}/version.txt" PROJECT_VER)
+set(PROJECT_VER "${PROJECT_VER}")
 project(nicemcu-desktop)

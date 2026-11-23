@@ -28,4 +28,20 @@ menu "Desktop"
         string "media-web password"
         default ""
 
+    config DESKTOP_OTA_URL
+        string "OTA manifest URL (empty = disabled)"
+        default ""
+        help
+            JSON manifest: {"project":"nicemcu-desktop","version":"0.3.1",
+            "url":"http://host/app.bin"}
+
+    config DESKTOP_OTA_CHECK_DELAY_S
+        int "Seconds after WiFi connect before OTA check"
+        default 15
+        range 0 600
+
+    config DESKTOP_HTTP_TOKEN
+        string "Local HTTP API token (empty = API disabled)"
+        default ""
+
 endmenu

@@ -15,7 +15,6 @@
 #include "freertos/semphr.h"
 #include "driver/spi_master.h"
 #include "driver/i2c_master.h"
-#include "driver/ledc.h"
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_panel_vendor.h"
@@ -27,11 +26,20 @@
 #include "esp_netif.h"
 #include "esp_netif_sntp.h"
 #include "nvs_flash.h"
+#include "esp_heap_caps.h"
 #include "esp_http_client.h"
 #include "esp_crt_bundle.h"
+#include "esp_app_desc.h"
+#include "esp_ota_ops.h"
 #include "lvgl.h"
 #include "include/lvgl/draw/lv_draw_utils.h"
 #include "include/lvgl/themes/lv_theme_default.h"
+#include "app_ui.h"
+#include "diag.h"
+#include "ota.h"
+#include "screen.h"
+#include "settings.h"
+#include "wifi_mgr.h"
 
 #define W 320
 #define H 240
@@ -61,9 +69,6 @@ static esp_lcd_panel_io_handle_t s_io;
 static i2c_master_bus_handle_t s_bus;
 static i2c_master_dev_handle_t s_tp;
 
-static volatile bool s_wifi_ok;
-static char s_ip_str[16] = "-";
-static int s_rssi = 0;
 static volatile bool s_wx_req;
 static volatile bool s_sntp_started;
 
@@ -78,8 +83,14 @@ static wx_t s_wx;
 static lv_obj_t *s_clock, *s_date, *s_temp, *s_cond, *s_hum, *s_wind;
 static lv_obj_t *s_wifi, *s_ip, *s_mem;
 static lv_obj_t *s_set_panel, *s_set_val;
-static int s_bright_pct = 60;
-static volatile bool s_sleep;
+static lv_obj_t *s_ota_msg_text;
+static volatile int s_ui_req;
+static bool s_calib_active;
+static bool s_calib_down;
+static int s_calib_idx;
+static int s_calib_raw[4][2];
+static lv_obj_t *s_calib_layer, *s_calib_hint, *s_calib_dots[4];
+static void calib_capture(int tx, int ty);
 
 typedef enum { POMO_IDLE, POMO_WORK, POMO_BREAK, POMO_PAUSE } pomo_t;
 static pomo_t s_pomo = POMO_IDLE, s_pomo_resume = POMO_WORK;
@@ -96,11 +107,11 @@ static bool on_color_done(esp_lcd_panel_io_handle_t io, esp_lcd_panel_io_event_d
 }
 
 static esp_err_t tp_read(uint8_t reg, uint8_t *buf, size_t n);
-static void ledc_set_bright(int pct);
 
 static void flush_cb(lv_display_t *disp, const lv_area_t *a, uint8_t *px)
 {
     size_t n = (a->x2 - a->x1 + 1) * (a->y2 - a->y1 + 1);
+    screen_flush_hook(a, px);
     lv_draw_rgb565_swap(px, n);
     esp_lcd_panel_draw_bitmap(s_panel, a->x1, a->y1, a->x2 + 1, a->y2 + 1, px);
 }
@@ -110,45 +121,39 @@ static void indev_cb(lv_indev_t *indev, lv_indev_data_t *d)
     static lv_coord_t lx, ly;
     uint8_t b[6];
     bool pressed = s_tp && tp_read(0x02, b, 6) == ESP_OK && (b[0] & 0x0F) > 0;
-    if (s_sleep) {
-        if (pressed) {
-            ledc_set_bright(s_bright_pct);
-            s_sleep = false;
-        }
+    if (screen_is_asleep()) {
+        if (pressed) screen_wake();
         d->state = LV_INDEV_STATE_RELEASED;
         return;
     }
     if (pressed) {
         int tx = ((b[1] & 0x0F) << 8) | b[2];
         int ty = ((b[3] & 0x0F) << 8) | b[4];
-        int nx = ty;
-        int ny = 239 - tx;
-        lx = nx < W ? nx : W - 1;
-        ly = ny < H ? ny : H - 1;
+        if (s_calib_active) {
+            if (!s_calib_down) calib_capture(tx, ty);
+            s_calib_down = true;
+        }
+        desktop_settings_t *cfg = settings_get();
+        int nx = (int)(cfg->ta * tx + cfg->tb * ty + cfg->tc + 0.5f);
+        int ny = (int)(cfg->td * tx + cfg->te * ty + cfg->tf + 0.5f);
+        lx = nx < 0 ? 0 : (nx < W ? nx : W - 1);
+        ly = ny < 0 ? 0 : (ny < H ? ny : H - 1);
         d->point.x = lx;
         d->point.y = ly;
         d->state = LV_INDEV_STATE_PRESSED;
     } else {
+        s_calib_down = false;
         d->point.x = lx;
         d->point.y = ly;
         d->state = LV_INDEV_STATE_RELEASED;
     }
 }
 
-static void ledc_set_bright(int pct)
-{
-    if (pct < 5) pct = 5;
-    if (pct > 100) pct = 100;
-    s_bright_pct = pct;
-    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, pct * 1023 / 100);
-    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
-}
-
 static void lcd_init(void)
 {
     spi_bus_config_t buscfg = {
         .mosi_io_num = PIN_MOSI, .miso_io_num = -1, .sclk_io_num = PIN_SCK,
-        .quadwp_io_num = -1, .quadhd_io_num = -1, .max_transfer_sz = W * 2 * 40,
+        .quadwp_io_num = -1, .quadhd_io_num = -1, .max_transfer_sz = W * 2 * 24,
     };
     ESP_ERROR_CHECK(spi_bus_initialize(SPI2_HOST, &buscfg, SPI_DMA_CH_AUTO));
 
@@ -168,18 +173,6 @@ static void lcd_init(void)
     ESP_ERROR_CHECK(esp_lcd_panel_swap_xy(s_panel, true));
     ESP_ERROR_CHECK(esp_lcd_panel_mirror(s_panel, true, false));
     ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(s_panel, true));
-
-    ledc_timer_config_t t = {
-        .speed_mode = LEDC_LOW_SPEED_MODE, .duty_resolution = LEDC_TIMER_10_BIT,
-        .timer_num = LEDC_TIMER_0, .freq_hz = 5000, .clk_cfg = LEDC_AUTO_CLK,
-    };
-    ESP_ERROR_CHECK(ledc_timer_config(&t));
-    ledc_channel_config_t ch = {
-        .gpio_num = PIN_BL, .speed_mode = LEDC_LOW_SPEED_MODE, .channel = LEDC_CHANNEL_0,
-        .timer_sel = LEDC_TIMER_0, .duty = 0, .hpoint = 0,
-    };
-    ESP_ERROR_CHECK(ledc_channel_config(&ch));
-    ledc_set_bright(60);
 }
 
 static esp_err_t tp_read(uint8_t reg, uint8_t *buf, size_t n)
@@ -207,45 +200,7 @@ static void touch_init(void)
     if (tp_read(0xA7, &id, 1) == ESP_OK) ESP_LOGI(TAG, "touch chip id 0x%02x", id);
 }
 
-/* ---------------- WiFi / SNTP ---------------- */
-static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
-{
-    if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
-        esp_wifi_connect();
-    } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
-        s_wifi_ok = false;
-        strcpy(s_ip_str, "-");
-        s_rssi = 0;
-    } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
-        ip_event_got_ip_t *ev = data;
-        snprintf(s_ip_str, sizeof s_ip_str, IPSTR, IP2STR(&ev->ip_info.ip));
-        s_wifi_ok = true;
-        ESP_LOGI(TAG, "got ip %s", s_ip_str);
-    }
-}
-
-static void wifi_init(void)
-{
-    ESP_ERROR_CHECK(nvs_flash_init());
-    ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
-    esp_netif_create_default_wifi_sta();
-
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event, NULL, NULL));
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event, NULL, NULL));
-
-    wifi_config_t wc = {0};
-    strncpy((char *)wc.sta.ssid, CONFIG_DESKTOP_WIFI_SSID, sizeof(wc.sta.ssid) - 1);
-    strncpy((char *)wc.sta.password, CONFIG_DESKTOP_WIFI_PASSWORD, sizeof(wc.sta.password) - 1);
-    wc.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wc));
-    ESP_ERROR_CHECK(esp_wifi_start());
-    esp_wifi_set_ps(WIFI_PS_NONE);
-}
-
+/* ---------------- SNTP ---------------- */
 static void sntp_start(void)
 {
     esp_sntp_config_t cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG("ntp.aliyun.com");
@@ -326,8 +281,9 @@ static const char *wx_text(int code)
 static bool weather_fetch(void)
 {
     ESP_LOGI(TAG, "weather fetch, heap=%u", (unsigned)esp_get_free_heap_size());
-    const double lat = atof(CONFIG_DESKTOP_LAT);
-    const double lon = atof(CONFIG_DESKTOP_LON);
+    desktop_settings_t *cfg = settings_get();
+    const double lat = atof(cfg->lat[0] ? cfg->lat : CONFIG_DESKTOP_LAT);
+    const double lon = atof(cfg->lon[0] ? cfg->lon : CONFIG_DESKTOP_LON);
     int n;
     static char buf[4096], url[320];
     ESP_LOGI(TAG, "weather coords lat=%.4f lon=%.4f", lat, lon);
@@ -363,7 +319,7 @@ static bool weather_fetch(void)
 static void weather_task(void *arg)
 {
     for (;;) {
-        if (s_wifi_ok && s_sntp_started) {
+        if (wifi_is_connected() && s_sntp_started) {
             if (weather_fetch()) {
                 for (int i = 0; i < 900 && !s_wx_req; i++) vTaskDelay(pdMS_TO_TICKS(1000));
             } else {
@@ -378,11 +334,11 @@ static void weather_task(void *arg)
 
 
 /* ---------------- media-web thin client ---------------- */
-#define MEDIA_HOST CONFIG_DESKTOP_MEDIA_HOST
 #define MEDIA_PORT 8097
 #define COVER_W 80
 #define COVER_H 80
-#define MEDIA_QUEUE_MAX 60
+#define MEDIA_QUEUE_MAX 8
+#define QUEUE_PAGE_N 4
 
 typedef struct {
     bool ok, pc_online, muted, playing;
@@ -393,14 +349,16 @@ typedef struct {
 
 static media_state_t s_media;
 static SemaphoreHandle_t s_media_mtx, s_cover_mtx;
-static uint8_t s_cover_front[COVER_W * COVER_H * 2];
-static uint8_t s_cover_back[COVER_W * COVER_H * 2];
+static uint8_t *s_cover_front;
+static uint8_t *s_cover_back;
 static volatile uint32_t s_cover_ver;
 static volatile bool s_cover_dirty;
 
 typedef struct { char bv[16]; char title[128]; } media_qitem_t;
 static media_qitem_t s_queue[MEDIA_QUEUE_MAX];
 static volatile int s_queue_n;
+static volatile int s_queue_start;
+static volatile int s_queue_total;
 static volatile uint32_t s_queue_ver;
 static volatile bool s_queue_req;
 
@@ -460,7 +418,9 @@ static esp_err_t media_http_evt(esp_http_client_event_t *e)
 static int media_req(const char *path, const char *body, char *out, int outlen, uint8_t *bin, int binlen)
 {
     char url[192];
-    snprintf(url, sizeof url, "http://" MEDIA_HOST ":%d%s", MEDIA_PORT, path);
+    const char *host = settings_get()->media_host;
+    if (!host[0]) host = CONFIG_DESKTOP_MEDIA_HOST;
+    snprintf(url, sizeof url, "http://%s:%d%s", host, MEDIA_PORT, path);
     media_http_buf_t b = {.out = out, .outlen = outlen, .bin = bin, .binlen = binlen, .used = 0};
     if (out) out[0] = 0;
     esp_http_client_config_t cfg = {
@@ -627,8 +587,9 @@ static void media_fetch_cover(const char *bv)
 {
     char path[64];
     snprintf(path, sizeof path, "/api/cover?bv=%s", bv);
-    int n = media_req(path, NULL, NULL, 0, s_cover_back, sizeof s_cover_back);
-    if (n == (int)sizeof s_cover_back) {
+    if (!s_cover_back) return;
+    int n = media_req(path, NULL, NULL, 0, s_cover_back, COVER_W * COVER_H * 2);
+    if (n == COVER_W * COVER_H * 2) {
         if (xSemaphoreTake(s_cover_mtx, pdMS_TO_TICKS(200)) == pdTRUE) {
             s_cover_ver++;
             xSemaphoreGive(s_cover_mtx);
@@ -645,7 +606,7 @@ static void media_send(int type, int arg)
 static void media_task(void *arg)
 {
     static char js[1536];
-    static char qjs[16384];
+    static char qjs[4096];
     int64_t last_poll = 0;
     for (;;) {
         media_cmd_t c;
@@ -685,8 +646,23 @@ static void media_task(void *arg)
         }
         if (s_queue_req) {
             s_queue_req = false;
-            if (media_req("/api/queue/status", NULL, qjs, sizeof qjs, NULL, 0) > 0) {
+            char qpath[64];
+            snprintf(qpath, sizeof qpath, "/api/queue/page?start=%d&n=%d",
+                     s_queue_start, QUEUE_PAGE_N);
+            int qr = media_req(qpath, NULL, qjs, sizeof qjs, NULL, 0);
+            if (qr > 0) {
+                int total = jint(qjs, "total");
+                int start = jint(qjs, "start");
                 s_queue_n = media_parse_queue(qjs);
+                if (total > 0) s_queue_total = total;
+                if (start >= 0) s_queue_start = start;
+                s_queue_ver++;
+                ESP_LOGI(TAG, "queue page req=%d n=%d start=%d total=%d", qr, s_queue_n,
+                         s_queue_start, s_queue_total);
+            } else if (media_req("/api/queue/status", NULL, qjs, sizeof qjs, NULL, 0) > 0) {
+                s_queue_n = media_parse_queue(qjs);
+                s_queue_total = s_queue_n;
+                s_queue_start = 0;
                 s_queue_ver++;
             }
         }
@@ -725,8 +701,8 @@ static lv_obj_t *mk_card(lv_obj_t *parent, int x, int y, int w, int h)
     return c;
 }
 
-static lv_obj_t *mk_btn(lv_obj_t *parent, int x, int y, int w, int h, const char *text,
-                        lv_event_cb_t cb, uint32_t bg)
+static lv_obj_t *mk_btn_font(lv_obj_t *parent, int x, int y, int w, int h, const char *text,
+                             lv_event_cb_t cb, uint32_t bg, const lv_font_t *font)
 {
     lv_obj_t *b = lv_button_create(parent);
     lv_obj_set_pos(b, x, y);
@@ -735,13 +711,20 @@ static lv_obj_t *mk_btn(lv_obj_t *parent, int x, int y, int w, int h, const char
     lv_obj_set_style_radius(b, 10, 0);
     lv_obj_set_style_shadow_width(b, 0, 0);
     lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_center(mk_label(b, &font_zh16, bg == C_CARD ? C_TEXT : 0x06121E, text));
+    lv_obj_center(mk_label(b, font, bg == C_CARD ? C_TEXT : 0x06121E, text));
     return b;
+}
+
+static lv_obj_t *mk_btn(lv_obj_t *parent, int x, int y, int w, int h, const char *text,
+                        lv_event_cb_t cb, uint32_t bg)
+{
+    return mk_btn_font(parent, x, y, w, h, text, cb, bg, &font_zh16);
 }
 
 
 /* ---- media page ---- */
 static lv_obj_t *s_media_page, *s_queue_page, *s_queue_list, *s_queue_title;
+static lv_obj_t *s_queue_prev, *s_queue_next;
 static lv_obj_t *s_med_title, *s_med_sub, *s_med_state, *s_med_pos, *s_med_dur;
 static lv_obj_t *s_med_prog, *s_med_vol, *s_med_vol_lbl, *s_med_play, *s_med_mute, *s_med_timer;
 static lv_obj_t *s_med_cover;
@@ -841,14 +824,34 @@ static void med_queue_cb(lv_event_t *e)
     s_media_active = true;
     s_poll_now = true;
     s_queue_seen = 0;
+    media_state_t st;
+    media_state_copy(&st);
+    s_queue_start = st.qidx > 0 ? (st.qidx / QUEUE_PAGE_N) * QUEUE_PAGE_N : 0;
+    if (st.qn > 0) s_queue_total = st.qn;
     s_queue_req = true;
     if (s_queue_list) lv_obj_clean(s_queue_list);
+}
+
+static void queue_prev_cb(lv_event_t *e)
+{
+    if (s_queue_start >= QUEUE_PAGE_N) {
+        s_queue_start -= QUEUE_PAGE_N;
+        s_queue_req = true;
+    }
+}
+
+static void queue_next_cb(lv_event_t *e)
+{
+    if (s_queue_start + s_queue_n < s_queue_total) {
+        s_queue_start += QUEUE_PAGE_N;
+        s_queue_req = true;
+    }
 }
 
 static void queue_row_cb(lv_event_t *e)
 {
     int i = (int)(intptr_t)lv_event_get_user_data(e);
-    media_send(MC_JUMP, i);
+    media_send(MC_JUMP, s_queue_start + i);
     lv_obj_add_flag(s_queue_page, LV_OBJ_FLAG_HIDDEN);
 }
 
@@ -925,27 +928,41 @@ static void media_queue_build(void)
     media_state_t st;
     media_state_copy(&st);
     for (int i = 0; i < s_queue_n; i++) {
+        bool cur = (s_queue_start + i) == st.qidx;
         lv_obj_t *row = lv_button_create(s_queue_list);
         lv_obj_set_size(row, 296, 42);
-        lv_obj_set_pos(row, 0, i * 46);
-        lv_obj_set_style_bg_color(row, lv_color_hex(i == st.qidx ? 0x1E2A3D : C_CARD), 0);
+        lv_obj_set_pos(row, 0, i * 44);
+        lv_obj_set_style_bg_color(row, lv_color_hex(cur ? 0x1E2A3D : C_CARD), 0);
         lv_obj_set_style_radius(row, 8, 0);
         lv_obj_set_style_shadow_width(row, 0, 0);
         lv_obj_add_event_cb(row, queue_row_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
         char b[240], t[128], w[400];
         snprintf(t, sizeof t, "%s", s_queue[i].title);
         sanitize_for_font(t, &font_zhfull);
-        snprintf(b, sizeof b, "%d. %s", i + 1, t);
+        snprintf(b, sizeof b, "%d. %s", s_queue_start + i + 1, t);
         wrap_title(b, w, sizeof w, 276, 2);
-        lv_obj_t *l = mk_label(row, &font_zhfull, i == st.qidx ? C_ACCENT : C_TEXT, w);
+        lv_obj_t *l = mk_label(row, &font_zhfull, cur ? C_ACCENT : C_TEXT, w);
         lv_obj_set_size(l, 280, 40);
         lv_label_set_long_mode(l, LV_LABEL_LONG_CLIP);
         lv_obj_align(l, LV_ALIGN_LEFT_MID, 6, 0);
     }
+    int total = s_queue_total;
+    int end = s_queue_start + s_queue_n;
+    if (total <= 0) total = end;
+    if (end > total) end = total;
     if (s_queue_title) {
-        char tb[32];
-        snprintf(tb, sizeof tb, "队列 %d/%d", st.qidx + 1, s_queue_n);
+        char tb[40];
+        if (s_queue_n <= 0) snprintf(tb, sizeof tb, "队列 0/%d", total);
+        else snprintf(tb, sizeof tb, "队列 %d-%d/%d", s_queue_start + 1, end, total);
         set_text(s_queue_title, tb);
+    }
+    if (s_queue_prev) {
+        if (s_queue_start <= 0) lv_obj_add_state(s_queue_prev, LV_STATE_DISABLED);
+        else lv_obj_remove_state(s_queue_prev, LV_STATE_DISABLED);
+    }
+    if (s_queue_next) {
+        if (s_queue_n <= 0 || end >= total) lv_obj_add_state(s_queue_next, LV_STATE_DISABLED);
+        else lv_obj_remove_state(s_queue_next, LV_STATE_DISABLED);
     }
     lv_obj_scroll_to_y(s_queue_list, 0, LV_ANIM_OFF);
     lv_obj_invalidate(s_queue_list);
@@ -953,10 +970,12 @@ static void media_queue_build(void)
 
 static void media_ui_build(lv_obj_t *scr)
 {
-    for (int i = 0; i < COVER_W * COVER_H; i++) {
-        uint16_t v = 0x0861;
-        s_cover_front[i * 2] = v & 0xFF;
-        s_cover_front[i * 2 + 1] = v >> 8;
+    if (s_cover_front) {
+        for (int i = 0; i < COVER_W * COVER_H; i++) {
+            uint16_t v = 0x0861;
+            s_cover_front[i * 2] = v & 0xFF;
+            s_cover_front[i * 2 + 1] = v >> 8;
+        }
     }
 
     s_media_page = lv_obj_create(scr);
@@ -1066,12 +1085,31 @@ static void media_ui_build(lv_obj_t *scr)
 
     s_queue_list = lv_obj_create(s_queue_page);
     lv_obj_set_pos(s_queue_list, 8, 28);
-    lv_obj_set_size(s_queue_list, 304, 204);
+    lv_obj_set_size(s_queue_list, 304, 180);
     lv_obj_set_style_bg_opa(s_queue_list, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(s_queue_list, 0, 0);
     lv_obj_set_style_pad_all(s_queue_list, 0, 0);
     lv_obj_set_scroll_dir(s_queue_list, LV_DIR_VER);
     lv_obj_set_scrollbar_mode(s_queue_list, LV_SCROLLBAR_MODE_AUTO);
+
+    s_queue_prev = lv_button_create(s_queue_page);
+    lv_obj_set_pos(s_queue_prev, 8, 210);
+    lv_obj_set_size(s_queue_prev, 48, 24);
+    lv_obj_set_style_bg_color(s_queue_prev, lv_color_hex(C_CARD), 0);
+    lv_obj_set_style_radius(s_queue_prev, 8, 0);
+    lv_obj_set_style_shadow_width(s_queue_prev, 0, 0);
+    lv_obj_add_event_cb(s_queue_prev, queue_prev_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_center(mk_label(s_queue_prev, &font_zh24, C_TEXT, "<"));
+
+    s_queue_next = lv_button_create(s_queue_page);
+    lv_obj_set_pos(s_queue_next, 264, 210);
+    lv_obj_set_size(s_queue_next, 48, 24);
+    lv_obj_set_style_bg_color(s_queue_next, lv_color_hex(C_CARD), 0);
+    lv_obj_set_style_radius(s_queue_next, 8, 0);
+    lv_obj_set_style_shadow_width(s_queue_next, 0, 0);
+    lv_obj_add_event_cb(s_queue_next, queue_next_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_center(mk_label(s_queue_next, &font_zh24, C_TEXT, ">"));
+
     lv_obj_add_flag(s_queue_page, LV_OBJ_FLAG_HIDDEN);
 }
 
@@ -1079,7 +1117,8 @@ static void media_ui_refresh(void)
 {
     if (s_cover_ver != s_cover_seen) {
         if (xSemaphoreTake(s_cover_mtx, pdMS_TO_TICKS(20)) == pdTRUE) {
-            memcpy(s_cover_front, s_cover_back, sizeof s_cover_front);
+            if (s_cover_front && s_cover_back)
+                memcpy(s_cover_front, s_cover_back, COVER_W * COVER_H * 2);
             s_cover_seen = s_cover_ver;
             xSemaphoreGive(s_cover_mtx);
         }
@@ -1148,7 +1187,7 @@ static void pomo_toggle(void)
         s_pomo = s_pomo_resume;
     } else {
         s_pomo = POMO_WORK;
-        s_pomo_left = 25 * 60;
+        s_pomo_left = settings_get()->pomo_work_min * 60;
     }
     pomo_refresh();
 }
@@ -1156,7 +1195,7 @@ static void pomo_toggle(void)
 static void pomo_reset(void)
 {
     s_pomo = POMO_IDLE;
-    s_pomo_left = 25 * 60;
+    s_pomo_left = settings_get()->pomo_work_min * 60;
     pomo_refresh();
 }
 
@@ -1167,13 +1206,6 @@ static void pomo_card_cb(lv_event_t *e)
 }
 
 /* ---- sleep / dialog ---- */
-static void go_sleep(void)
-{
-    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, 0);
-    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
-    s_sleep = true;
-}
-
 static void show_msg(const char *title, const char *text)
 {
     lv_obj_t *mb = lv_msgbox_create(NULL);
@@ -1182,28 +1214,221 @@ static void show_msg(const char *title, const char *text)
     lv_obj_t *t = lv_msgbox_add_title(mb, title);
     lv_obj_set_style_text_font(t, &font_zh24, 0);
     lv_obj_t *b = lv_msgbox_add_text(mb, text);
-    lv_obj_set_style_text_font(b, &font_zh16, 0);
+    lv_obj_set_style_text_font(b, &font_zhfull, 0);
     lv_msgbox_add_close_button(mb);
     lv_obj_center(mb);
+}
+
+static void ota_msg_delete_cb(lv_event_t *e)
+{
+    s_ota_msg_text = NULL;
+}
+
+static void show_ota_msg(void)
+{
+    lv_obj_t *mb = lv_msgbox_create(NULL);
+    lv_obj_set_width(mb, 240);
+    lv_obj_set_style_text_font(mb, &font_zh16, 0);
+    lv_obj_t *t = lv_msgbox_add_title(mb, "OTA");
+    lv_obj_set_style_text_font(t, &font_zh24, 0);
+    s_ota_msg_text = lv_msgbox_add_text(mb, "正在检查更新…");
+    lv_obj_set_style_text_font(s_ota_msg_text, &font_zhfull, 0);
+    lv_msgbox_add_close_button(mb);
+    lv_obj_add_event_cb(mb, ota_msg_delete_cb, LV_EVENT_DELETE, NULL);
+    lv_obj_center(mb);
+}
+
+/* ---- touch calibration ---- */
+static const int s_calib_tgt[4][2] = {{20, 20}, {300, 20}, {20, 220}, {300, 220}};
+
+static double det3(const double m[3][3])
+{
+    return m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+         - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+         + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+}
+
+static bool solve3(const double m[3][3], const double b[3], double x[3])
+{
+    double d = det3(m);
+    if (fabs(d) < 1e-9) return false;
+    for (int j = 0; j < 3; j++) {
+        double t[3][3];
+        memcpy(t, m, sizeof t);
+        for (int i = 0; i < 3; i++) t[i][j] = b[i];
+        x[j] = det3(t) / d;
+    }
+    return true;
+}
+
+static bool solve_affine(const int raw[4][2], const int tgt[4][2], float out[6])
+{
+    double sxx = 0, sxy = 0, sx = 0, syy = 0, sy = 0;
+    double sxX = 0, syX = 0, sX = 0, sxY = 0, syY = 0, sY = 0;
+    for (int i = 0; i < 4; i++) {
+        double rx = raw[i][0], ry = raw[i][1], X = tgt[i][0], Y = tgt[i][1];
+        sxx += rx * rx;
+        sxy += rx * ry;
+        sx += rx;
+        syy += ry * ry;
+        sy += ry;
+        sxX += rx * X;
+        syX += ry * X;
+        sX += X;
+        sxY += rx * Y;
+        syY += ry * Y;
+        sY += Y;
+    }
+    double m[3][3] = {{sxx, sxy, sx}, {sxy, syy, sy}, {sx, sy, 4}};
+    double bx[3] = {sxX, syX, sX}, by[3] = {sxY, syY, sY};
+    double ax[3], ay[3];
+    if (!solve3(m, bx, ax) || !solve3(m, by, ay)) return false;
+    out[0] = (float)ax[0];
+    out[1] = (float)ax[1];
+    out[2] = (float)ax[2];
+    out[3] = (float)ay[0];
+    out[4] = (float)ay[1];
+    out[5] = (float)ay[2];
+    return true;
+}
+
+static void calib_close(void)
+{
+    if (s_calib_layer) lv_obj_delete(s_calib_layer);
+    s_calib_layer = NULL;
+    s_calib_hint = NULL;
+    for (int i = 0; i < 4; i++) s_calib_dots[i] = NULL;
+    s_calib_active = false;
+    s_calib_down = false;
+}
+
+static void calib_cancel_cb(lv_event_t *e)
+{
+    calib_close();
+}
+
+static void calib_capture(int tx, int ty)
+{
+    if (!s_calib_active || s_calib_idx >= 4) return;
+    s_calib_raw[s_calib_idx][0] = tx;
+    s_calib_raw[s_calib_idx][1] = ty;
+    s_calib_idx++;
+    if (s_calib_idx >= 4) {
+        float out[6];
+        if (solve_affine(s_calib_raw, s_calib_tgt, out)) {
+            desktop_settings_t *cfg = settings_get();
+            cfg->ta = out[0];
+            cfg->tb = out[1];
+            cfg->tc = out[2];
+            cfg->td = out[3];
+            cfg->te = out[4];
+            cfg->tf = out[5];
+            settings_save();
+            calib_close();
+            show_msg("触摸校准", "校准完成");
+        } else {
+            s_calib_idx = 0;
+            if (s_calib_hint) lv_label_set_text(s_calib_hint, "校准失败，请重试");
+            for (int i = 0; i < 4; i++) {
+                if (s_calib_dots[i])
+                    lv_obj_set_style_text_color(s_calib_dots[i], lv_color_hex(i == 0 ? C_ACCENT : C_SUB), 0);
+            }
+        }
+        return;
+    }
+    if (s_calib_hint) {
+        char b[64];
+        snprintf(b, sizeof b, "触摸校准：点击高亮十字 (%d/4)", s_calib_idx + 1);
+        lv_label_set_text(s_calib_hint, b);
+    }
+    for (int i = 0; i < 4; i++) {
+        if (s_calib_dots[i])
+            lv_obj_set_style_text_color(s_calib_dots[i], lv_color_hex(i == s_calib_idx ? C_ACCENT : C_SUB), 0);
+    }
+}
+
+static void calib_open_cb(lv_event_t *e)
+{
+    if (s_calib_active) return;
+    s_calib_active = true;
+    s_calib_down = false;
+    s_calib_idx = 0;
+    s_calib_layer = lv_obj_create(lv_layer_top());
+    lv_obj_set_size(s_calib_layer, W, H);
+    lv_obj_set_pos(s_calib_layer, 0, 0);
+    lv_obj_set_style_bg_color(s_calib_layer, lv_color_hex(C_BG), 0);
+    lv_obj_set_style_bg_opa(s_calib_layer, LV_OPA_COVER, 0);
+    lv_obj_set_style_pad_all(s_calib_layer, 0, 0);
+    lv_obj_set_style_border_width(s_calib_layer, 0, 0);
+    lv_obj_set_style_radius(s_calib_layer, 0, 0);
+    lv_obj_remove_flag(s_calib_layer, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_move_foreground(s_calib_layer);
+    s_calib_hint = mk_label(s_calib_layer, &font_zhfull, C_TEXT, "触摸校准：点击高亮十字 (1/4)");
+    lv_obj_align(s_calib_hint, LV_ALIGN_TOP_MID, 0, 8);
+    for (int i = 0; i < 4; i++) {
+        lv_obj_t *box = lv_obj_create(s_calib_layer);
+        lv_obj_set_pos(box, s_calib_tgt[i][0] - 24, s_calib_tgt[i][1] - 24);
+        lv_obj_set_size(box, 48, 48);
+        lv_obj_set_style_bg_opa(box, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(box, 0, 0);
+        lv_obj_set_style_pad_all(box, 0, 0);
+        lv_obj_remove_flag(box, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_t *dot = mk_label(box, &font_zh48, i == 0 ? C_ACCENT : C_SUB, "+");
+        lv_obj_center(dot);
+        s_calib_dots[i] = dot;
+    }
+    mk_btn_font(s_calib_layer, 110, 200, 100, 30, "取消", calib_cancel_cb, C_CARD, &font_zhfull);
 }
 
 /* ---- settings overlay ---- */
 static void set_close_cb(lv_event_t *e) { lv_obj_add_flag(s_set_panel, LV_OBJ_FLAG_HIDDEN); }
 static void set_refresh_cb(lv_event_t *e) { s_wx_req = true; lv_obj_add_flag(s_set_panel, LV_OBJ_FLAG_HIDDEN); }
-static void set_sleep_cb(lv_event_t *e) { go_sleep(); lv_obj_add_flag(s_set_panel, LV_OBJ_FLAG_HIDDEN); }
+static void set_sleep_cb(lv_event_t *e) { screen_sleep(); lv_obj_add_flag(s_set_panel, LV_OBJ_FLAG_HIDDEN); }
 static void set_about_cb(lv_event_t *e)
 {
-    show_msg("关于", "芯片 ESP32-S3 N16R8\n触摸 CST816T\n固件 v0.2");
+    if (s_calib_active) return;
+    const esp_app_desc_t *app = esp_app_get_description();
+    const esp_partition_t *run = esp_ota_get_running_partition();
+    char ota[32];
+    if (ota_get_state() == OTA_DOWNLOADING)
+        snprintf(ota, sizeof ota, "下载中 %d%%", ota_get_progress());
+    else
+        snprintf(ota, sizeof ota, "%s", ota_state_text());
+    char b[192];
+    snprintf(b, sizeof b, "芯片 ESP32-S3 N16R8\n触摸 CST816T\n固件 v%s\n槽位 %s\nOTA %s",
+             app->version, run ? run->label : "?", ota);
+    show_msg("关于", b);
+}
+
+static void set_ota_cb(lv_event_t *e)
+{
+    ota_state_t st = ota_get_state();
+    if (st == OTA_CHECKING || st == OTA_DOWNLOADING || st == OTA_REBOOTING) {
+        show_ota_msg();
+        return;
+    }
+    if (!ota_configured()) {
+        show_msg("OTA", "未配置 OTA 地址\n请在 menuconfig 设置");
+        return;
+    }
+    if (!ota_request_check()) {
+        show_msg("OTA", "更新任务已在运行");
+        return;
+    }
+    show_ota_msg();
 }
 
 static void set_slider_cb(lv_event_t *e)
 {
     int v = lv_slider_get_value(lv_event_get_target(e));
-    ledc_set_bright(v);
+    screen_set_bright(v);
+    settings_get()->bright = (uint8_t)v;
     char b[16];
     snprintf(b, sizeof b, "%d%%", v);
     set_text(s_set_val, b);
 }
+
+static void set_slider_save_cb(lv_event_t *e) { settings_save(); }
 
 static void settings_build(void)
 {
@@ -1234,15 +1459,18 @@ static void settings_build(void)
     lv_obj_set_pos(sl, 0, 58);
     lv_obj_set_size(sl, 256, 14);
     lv_slider_set_range(sl, 5, 100);
-    lv_slider_set_value(sl, s_bright_pct, LV_ANIM_OFF);
+    lv_slider_set_value(sl, screen_get_bright(), LV_ANIM_OFF);
     lv_obj_set_style_bg_color(sl, lv_color_hex(C_ACCENT), LV_PART_INDICATOR);
     lv_obj_set_style_bg_color(sl, lv_color_hex(C_ACCENT), LV_PART_KNOB);
     lv_obj_add_event_cb(sl, set_slider_cb, LV_EVENT_VALUE_CHANGED, NULL);
+    lv_obj_add_event_cb(sl, set_slider_save_cb, LV_EVENT_RELEASED, NULL);
 
     mk_btn(s_set_panel, 0, 84, 124, 36, "刷新天气", set_refresh_cb, C_ACCENT);
     mk_btn(s_set_panel, 132, 84, 124, 36, "息屏", set_sleep_cb, C_CARD);
-    mk_btn(s_set_panel, 0, 128, 124, 36, "关于", set_about_cb, C_CARD);
-    mk_btn(s_set_panel, 132, 128, 124, 36, "关闭", set_close_cb, C_ACCENT);
+    lv_obj_t *about = mk_btn(s_set_panel, 0, 128, 70, 36, "关于", set_about_cb, C_CARD);
+    lv_obj_add_event_cb(about, calib_open_cb, LV_EVENT_LONG_PRESSED, NULL);
+    mk_btn_font(s_set_panel, 78, 128, 100, 36, "检查更新", set_ota_cb, C_CARD, &font_zhfull);
+    mk_btn(s_set_panel, 186, 128, 70, 36, "关闭", set_close_cb, C_ACCENT);
 
     lv_obj_add_flag(s_set_panel, LV_OBJ_FLAG_HIDDEN);
 }
@@ -1251,6 +1479,55 @@ static void settings_open_cb(lv_event_t *e)
 {
     lv_obj_remove_flag(s_set_panel, LV_OBJ_FLAG_HIDDEN);
     lv_obj_move_foreground(s_set_panel);
+}
+
+void app_ui_request(int page)
+{
+    s_ui_req = page;
+}
+
+void app_get_queue_info(int *n, int *start, int *total)
+{
+    *n = s_queue_n;
+    *start = s_queue_start;
+    *total = s_queue_total;
+}
+
+static void ui_apply_request(void)
+{
+    int p = s_ui_req;
+    if (!p) return;
+    s_ui_req = APP_UI_NONE;
+    if (p != APP_UI_CALIB && s_calib_active) calib_close();
+    switch (p) {
+    case APP_UI_DASHBOARD:
+        med_close_cb(NULL);
+        med_queue_close_cb(NULL);
+        lv_obj_add_flag(s_set_panel, LV_OBJ_FLAG_HIDDEN);
+        break;
+    case APP_UI_MEDIA:
+        med_open_cb(NULL);
+        med_queue_close_cb(NULL);
+        lv_obj_add_flag(s_set_panel, LV_OBJ_FLAG_HIDDEN);
+        break;
+    case APP_UI_SETTINGS:
+        settings_open_cb(NULL);
+        break;
+    case APP_UI_QUEUE:
+        med_open_cb(NULL);
+        med_queue_cb(NULL);
+        lv_obj_add_flag(s_set_panel, LV_OBJ_FLAG_HIDDEN);
+        break;
+    case APP_UI_CALIB:
+        calib_open_cb(NULL);
+        break;
+    case APP_UI_ABOUT:
+        set_about_cb(NULL);
+        break;
+    case APP_UI_OTA:
+        set_ota_cb(NULL);
+        break;
+    }
 }
 
 static void ui_build(void)
@@ -1289,9 +1566,9 @@ static void ui_build(void)
     /* C: device status */
     lv_obj_t *c = mk_card(scr, 4, 116, 196, 120);
     mk_label(c, &font_zh16, C_ACCENT, "设备状态");
-    s_wifi = mk_label(c, &font_zh16, C_TEXT, "WiFi 连接中");
+    s_wifi = mk_label(c, &font_zhfull, C_TEXT, "WiFi 连接中");
     lv_obj_set_pos(s_wifi, 0, 24);
-    s_ip = mk_label(c, &font_zh16, C_TEXT, "IP -");
+    s_ip = mk_label(c, &font_zhfull, C_TEXT, "IP -");
     lv_obj_set_pos(s_ip, 0, 46);
     s_mem = mk_label(c, &font_zh16, C_SUB, "内存 --KB 运行 --:--");
     lv_obj_set_pos(s_mem, 0, 68);
@@ -1319,8 +1596,25 @@ static void ui_timer_cb(lv_timer_t *t)
 {
     static uint32_t last_wx_seq;
     media_ui_refresh();
-    static int64_t last_retry;
     char buf[64];
+    if (s_ota_msg_text) {
+        char ob[128];
+        ota_state_t st = ota_get_state();
+        if (st == OTA_DOWNLOADING)
+            snprintf(ob, sizeof ob, "下载中 %d%%\n当前 v%s", ota_get_progress(),
+                     esp_app_get_description()->version);
+        else if (st == OTA_CHECKING)
+            snprintf(ob, sizeof ob, "正在检查更新…\n当前 v%s", esp_app_get_description()->version);
+        else if (st == OTA_UP_TO_DATE)
+            snprintf(ob, sizeof ob, "已是最新版本\n当前 v%s", esp_app_get_description()->version);
+        else if (st == OTA_FAILED)
+            snprintf(ob, sizeof ob, "更新失败\n%s", ota_last_error());
+        else if (st == OTA_REBOOTING)
+            snprintf(ob, sizeof ob, "更新完成，即将重启");
+        else
+            snprintf(ob, sizeof ob, "待命");
+        lv_label_set_text(s_ota_msg_text, ob);
+    }
 
     time_t now = time(NULL);
     struct tm tm;
@@ -1336,12 +1630,17 @@ static void ui_timer_cb(lv_timer_t *t)
         set_text(s_date, "正在获取时间");
     }
 
-    if (s_wifi_ok) {
-        wifi_ap_record_t ap;
-        if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) s_rssi = ap.rssi;
-        snprintf(buf, sizeof buf, "WiFi %s %ddBm", CONFIG_DESKTOP_WIFI_SSID, s_rssi);
+    if (wifi_is_portal()) {
+        set_text(s_wifi, "配网模式");
+        snprintf(buf, sizeof buf, "AP %s", wifi_portal_ssid());
+        set_text(s_ip, buf);
+    } else if (wifi_is_connected()) {
+        char ip[16], ssid[33];
+        wifi_get_ip(ip, sizeof ip);
+        wifi_get_ssid(ssid, sizeof ssid);
+        snprintf(buf, sizeof buf, "WiFi %s %ddBm", ssid, wifi_get_rssi());
         set_text(s_wifi, buf);
-        snprintf(buf, sizeof buf, "IP %s", s_ip_str);
+        snprintf(buf, sizeof buf, "IP %s", ip);
         set_text(s_ip, buf);
         if (!s_sntp_started) {
             sntp_start();
@@ -1351,21 +1650,16 @@ static void ui_timer_cb(lv_timer_t *t)
     } else {
         set_text(s_wifi, "WiFi 未连接");
         set_text(s_ip, "IP -");
-        int64_t ms = esp_timer_get_time() / 1000;
-        if (ms - last_retry > 5000) {
-            last_retry = ms;
-            esp_wifi_connect();
-        }
     }
 
     if (s_pomo == POMO_WORK || s_pomo == POMO_BREAK) {
         if (--s_pomo_left <= 0) {
             if (s_pomo == POMO_WORK) {
                 s_pomo = POMO_BREAK;
-                s_pomo_left = 5 * 60;
+                s_pomo_left = settings_get()->pomo_break_min * 60;
             } else {
                 s_pomo = POMO_WORK;
-                s_pomo_left = 25 * 60;
+                s_pomo_left = settings_get()->pomo_work_min * 60;
             }
         }
         pomo_refresh();
@@ -1396,8 +1690,18 @@ void app_main(void)
     setenv("TZ", "CST-8", 1);
     tzset();
 
+    diag_log_install();
+    ESP_ERROR_CHECK(nvs_flash_init());
+    settings_init();
     lcd_init();
     touch_init();
+    screen_init(PIN_BL);
+    s_pomo_left = settings_get()->pomo_work_min * 60;
+
+    s_cover_front = heap_caps_malloc(COVER_W * COVER_H * 2, MALLOC_CAP_SPIRAM);
+    s_cover_back = heap_caps_malloc(COVER_W * COVER_H * 2, MALLOC_CAP_SPIRAM);
+    if (!s_cover_front) s_cover_front = malloc(COVER_W * COVER_H * 2);
+    if (!s_cover_back) s_cover_back = malloc(COVER_W * COVER_H * 2);
 
     s_media_mtx = xSemaphoreCreateMutex();
     s_cover_mtx = xSemaphoreCreateMutex();
@@ -1407,7 +1711,7 @@ void app_main(void)
     lv_init();
     lv_tick_set_cb(tick_cb);
     lv_display_t *disp = lv_display_create(W, H);
-    static uint16_t buf1[W * 40], buf2[W * 40];
+    static uint16_t buf1[W * 24], buf2[W * 24];
     lv_display_set_flush_cb(disp, flush_cb);
     lv_display_set_buffers(disp, buf1, buf2, sizeof(buf1), LV_DISPLAY_RENDER_MODE_PARTIAL);
     esp_lcd_panel_io_callbacks_t cbs = {.on_color_trans_done = on_color_done};
@@ -1424,10 +1728,11 @@ void app_main(void)
     xTaskCreate(weather_task, "weather", 8192, NULL, 4, NULL);
     xTaskCreate(media_task, "media", 6144, NULL, 1, NULL);
 
-    wifi_init();
+    wifi_mgr_start();
     ESP_LOGI(TAG, "desktop started");
 
     while (1) {
+        ui_apply_request();
         uint32_t next = lv_timer_handler();
         vTaskDelay(pdMS_TO_TICKS(next < 1 ? 1 : (next > 10 ? 10 : next)));
     }
