@@ -1,0 +1,9 @@
+build/
+sdkconfig
+sdkconfig.old
+sdkconfig.*.old
+dependencies.lock
+components/lvgl
+*.bin
+*.elf
+*.bak

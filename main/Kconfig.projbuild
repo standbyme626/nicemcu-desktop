@@ -1,0 +1,23 @@
+menu "Desktop"
+
+    config DESKTOP_WIFI_SSID
+        string "WiFi SSID"
+        default ""
+
+    config DESKTOP_WIFI_PASSWORD
+        string "WiFi password"
+        default ""
+
+    config DESKTOP_MEDIA_HOST
+        string "media-web host or IP"
+        default "192.168.1.100"
+
+    config DESKTOP_MEDIA_USER
+        string "media-web user"
+        default ""
+
+    config DESKTOP_MEDIA_PASSWORD
+        string "media-web password"
+        default ""
+
+endmenu

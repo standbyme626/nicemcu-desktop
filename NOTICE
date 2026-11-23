@@ -1,0 +1,10 @@
+Third-party assets / licenses
+
+- LVGL (v9.6.0) — MIT — https://github.com/lvgl/lvgl
+- Noto Sans SC (subset bitmap fonts generated with lv_font_conv) —
+  SIL Open Font License 1.1 — https://fonts.google.com/noto
+- FontAwesome Free (symbol glyphs used by LVGL's LV_SYMBOL_*) —
+  CC BY 4.0 / SIL OFL 1.1 / MIT — https://fontawesome.com/license/free
+
+Bitmap fonts in main/fonts/ are generated from Noto Sans SC with
+lv_font_conv; the generated files are derivative works under OFL.
